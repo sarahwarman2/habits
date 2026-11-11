@@ -45,16 +45,20 @@
   #status{color:var(--muted);font-size:13px;text-align:center;margin-top:8px}
   ul{list-style:none;margin:0;padding:0;display:grid;gap:8px}
   .edit-row{display:grid;grid-template-columns:auto 1fr auto auto auto;gap:6px;align-items:center;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:8px}
-  input[type=text],textarea{width:100%;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--ink);font-size:16px;padding:0 10px;font-family:inherit}
-  input[type=text]{min-height:44px}
+  input[type=text],input[type=password],textarea{width:100%;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--ink);font-size:16px;padding:0 10px;font-family:inherit}
+  input[type=text],input[type=password]{min-height:44px;margin-top:8px}
+  .edit-row input{margin-top:0}
   textarea{padding:8px 10px;min-height:90px;font-size:14px}
   .small{min-width:44px;min-height:44px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--ink);font-size:16px}
   .small.del{color:var(--warn)}
   .swatch{width:44px;height:44px;border-radius:50%;border:3px solid var(--card);box-shadow:0 0 0 1.5px var(--line)}
   .add{display:grid;grid-template-columns:1fr auto;gap:8px;margin-top:10px}
+  .add input{margin-top:0}
   .btn{min-height:44px;padding:0 16px;border-radius:10px;border:0;background:var(--accent);color:#fff;font-size:16px}
   .btn.alt{background:var(--card);color:var(--ink);border:1px solid var(--line)}
-  .row2{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}
+  .row2{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+  details{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:10px 12px}
+  summary{font-weight:600}
 </style>
 </head>
 <body>
@@ -75,8 +79,24 @@
       <button class="btn" id="addBtn">Add</button>
     </div>
 
+    <h2>Sync across devices</h2>
+    <p class="hint" id="syncHint">Off. Your habits stay on this device only.</p>
+    <details id="syncBox">
+      <summary>Set up sync</summary>
+      <p class="hint" style="margin-top:8px">Your habits are saved in a file called habits.json inside a private GitHub repository that you own. Use a token that can only reach that one repository. The token is stored on this device and is never included in backups.</p>
+      <input type="text" id="syOwner" placeholder="GitHub username" autocapitalize="off" autocorrect="off" spellcheck="false">
+      <input type="text" id="syRepo" placeholder="Private repository name" autocapitalize="off" autocorrect="off" spellcheck="false">
+      <input type="password" id="syToken" placeholder="Token" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+      <div class="row2">
+        <button class="btn" id="syConnect">Connect and sync</button>
+        <button class="btn alt" id="syNow">Sync now</button>
+        <button class="btn alt" id="syOff">Disconnect</button>
+      </div>
+      <p id="syMsg" class="hint" style="margin-top:10px"></p>
+    </details>
+
     <h2>Back up and restore</h2>
-    <p class="hint">Your habits live only on this phone. Back up now and then, and before deleting the app.</p>
+    <p class="hint">A backup is a safety copy you keep yourself. Restoring replaces everything on this device.</p>
     <div class="row2">
       <button class="btn" id="backupBtn">Back up</button>
       <button class="btn alt" id="fileBtn">Restore from file</button>
@@ -101,11 +121,20 @@
 
 <script>
 (function(){
-  var KEY = "habit-grid-v1";
+  var KEY = "habit-grid-v1";           // local data (format version 2 inside)
+  var SYNC_KEY = "habit-grid-sync";     // GitHub connection details, kept on this device only
+  var API_BASE = "https://api.github.com";
+  var DATA_FILE = "habits.json";
   var DEFAULTS = ["No-spend day","Read from a physical book","Made art","Cooked a full meal"];
   var PALETTE = ["#e69f00","#56b4e9","#009e73","#d55e00","#cc79a7","#0072b2","#f0e442","#8e6bbf","#7a9a3a","#e15759"];
   var NDAYS = 120;
-  var items = [], days = {}, editing = false, pendingDelete = null, pendingRestore = false, didScroll = false, renderedDay = "";
+
+  // items: the habit list. cfgT: when the list was last changed.
+  // cells: "YYYY-MM-DD|habitId" -> [1 or 0, time]. 0 means cleared. Newest time wins when syncing.
+  // days: quick lookup built from cells for drawing the grid.
+  var items = [], cfgT = 0, cells = {}, days = {};
+  var editing = false, pendingDelete = null, pendingRestore = false, didScroll = false, renderedDay = "";
+  var syncing = false, syncAgain = false, syncTimer = null;
 
   var $ = function(id){ return document.getElementById(id); };
   function pad(n){ return n < 10 ? "0" + n : "" + n; }
@@ -122,6 +151,13 @@
     for (var i = 0; i < PALETTE.length; i++) if (used.indexOf(PALETTE[i]) < 0) return PALETTE[i];
     return PALETTE[items.length % PALETTE.length];
   }
+  function rebuildDays(){
+    days = {};
+    Object.keys(cells).forEach(function(k){
+      var c = cells[k];
+      if (c && c[0] === 1){ var p = k.split("|"); (days[p[0]] = days[p[0]] || {})[p[1]] = 1; }
+    });
+  }
   function monthCount(itemId, y, m){
     var c = 0, last = new Date(y, m+1, 0).getDate();
     for (var d = 1; d <= last; d++){
@@ -130,36 +166,178 @@
     }
     return c;
   }
+  function setCell(dk, id, v){
+    var k = dk + "|" + id, old = cells[k];
+    cells[k] = [v, Math.max(Date.now(), old ? old[1] + 1 : 0)];
+  }
+  function touchCfg(){ cfgT = Math.max(Date.now(), cfgT + 1); }
 
-  /* ---------- storage: this phone only ---------- */
-  function save(){
+  /* ---------- local storage ---------- */
+  function save(noSync){
     try {
-      localStorage.setItem(KEY, JSON.stringify({items: items, days: days}));
-      setStatus("Saved on this phone");
+      localStorage.setItem(KEY, JSON.stringify({v: 2, items: items, cfgT: cfgT, cells: cells}));
     } catch(e){
       setStatus("Couldn't save. Storage may be full or blocked.");
+      return;
     }
+    if (!syncConfig()){ setStatus("Saved on this device"); }
+    else if (!noSync){ setStatus("Saved. Syncing soon…"); scheduleSync(); }
   }
   function load(){
     try {
       var o = JSON.parse(localStorage.getItem(KEY) || "null");
-      if (o && Array.isArray(o.items) && o.days && typeof o.days === "object"){ items = o.items; days = o.days; return true; }
-    } catch(e){}
-    return false;
+      if (!o || !Array.isArray(o.items)) return false;
+      items = o.items;
+      if (o.v === 2 && o.cells){ cells = o.cells; cfgT = o.cfgT || 0; }
+      else if (o.days){   // older format: marks only, no times
+        cells = {};
+        Object.keys(o.days).forEach(function(dk){
+          Object.keys(o.days[dk] || {}).forEach(function(id){ if (o.days[dk][id] === 1) cells[dk + "|" + id] = [1, 0]; });
+        });
+        cfgT = 0;
+      } else return false;
+      return true;
+    } catch(e){ return false; }
   }
   function init(){
     if (!load()){
-      items = DEFAULTS.map(function(n, i){ return {id:newId(), name:n, color:PALETTE[i]}; });
-      days = {};
-      save();
+      items = DEFAULTS.map(function(n, i){ return {id: "default-" + (i+1), name: n, color: PALETTE[i]}; });
+      cells = {}; cfgT = 0;
+      save(true);
     } else {
       var changed = false;
       items.forEach(function(it){ if (!it.color){ it.color = pickColor(); changed = true; } });
-      if (changed) save();
-      setStatus("Saved on this phone");
+      if (changed) save(true);
     }
+    rebuildDays();
+    setStatus(syncConfig() ? "Saved on this device" : "Saved on this device");
     try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch(e){}
   }
+
+  /* ---------- sync with a private GitHub repository ---------- */
+  function syncConfig(){
+    try {
+      var c = JSON.parse(localStorage.getItem(SYNC_KEY) || "null");
+      if (c && c.owner && c.repo && c.token) return c;
+    } catch(e){}
+    return null;
+  }
+  function saveSyncConfig(c){ try { localStorage.setItem(SYNC_KEY, JSON.stringify(c)); } catch(e){} }
+  function b64e(s){ return btoa(unescape(encodeURIComponent(s))); }
+  function b64d(s){ return decodeURIComponent(escape(atob(s.replace(/\s/g, "")))); }
+  function fileUrl(c){ return API_BASE + "/repos/" + encodeURIComponent(c.owner) + "/" + encodeURIComponent(c.repo) + "/contents/" + DATA_FILE; }
+  function headers(c){
+    return {"Authorization": "Bearer " + c.token, "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"};
+  }
+  function canonical(o){
+    var sorted = {};
+    Object.keys(o.cells || {}).sort().forEach(function(k){ sorted[k] = o.cells[k]; });
+    return JSON.stringify({v: 2, items: o.items || [], cfgT: o.cfgT || 0, cells: sorted});
+  }
+  function localState(){ return {items: items, cfgT: cfgT, cells: cells}; }
+  function mergeRemote(r){
+    var changed = false;
+    if (r && Array.isArray(r.items) && typeof r.cfgT === "number" && r.cfgT > cfgT){ items = r.items; cfgT = r.cfgT; changed = true; }
+    var rc = (r && r.cells) || {};
+    Object.keys(rc).forEach(function(k){
+      var b = rc[k], a = cells[k];
+      if (!Array.isArray(b) || typeof b[1] !== "number") return;
+      if (!a || b[1] > a[1]){ cells[k] = b; changed = true; }
+    });
+    return changed;
+  }
+  function syncError(status, msg){ var e = new Error(msg); e.status = status; return e; }
+  function fetchRemote(c){
+    return fetch(fileUrl(c), {headers: headers(c), cache: "no-store"}).then(function(res){
+      if (res.status === 404) return {sha: null, data: null};
+      if (res.status === 401) throw syncError(401, "GitHub rejected the token. It may be wrong or expired.");
+      if (res.status === 403) throw syncError(403, "GitHub refused access. Check the token's permissions, or try again later.");
+      if (!res.ok) throw syncError(res.status, "GitHub returned an error (" + res.status + ").");
+      return res.json().then(function(j){
+        var data;
+        try { data = JSON.parse(b64d(j.content || "")); } catch(e){ throw syncError(0, "habits.json in the repository isn't readable. Nothing was changed."); }
+        return {sha: j.sha, data: data};
+      });
+    });
+  }
+  function pushRemote(c, sha){
+    var body = {message: "Habit grid sync", content: b64e(canonical(localState()))};
+    if (sha) body.sha = sha;
+    return fetch(fileUrl(c), {method: "PUT", headers: Object.assign({"Content-Type": "application/json"}, headers(c)), body: JSON.stringify(body)}).then(function(res){
+      if (res.status === 409 || res.status === 422) throw syncError(409, "conflict");
+      if (res.status === 401) throw syncError(401, "GitHub rejected the token. It may be wrong or expired.");
+      if (res.status === 403) throw syncError(403, "GitHub refused to save. The token needs Contents: read and write on that repository.");
+      if (res.status === 404) throw syncError(404, "Repository not found, or the token can't reach it.");
+      if (!res.ok) throw syncError(res.status, "GitHub returned an error (" + res.status + ").");
+    });
+  }
+  function syncOnce(c, attempt){
+    return fetchRemote(c).then(function(r){
+      var changed = mergeRemote(r.data);
+      if (!r.sha && cfgT === 0){ touchCfg(); changed = true; }
+      var needPush = !r.data || canonical(r.data) !== canonical(localState());
+      var p = needPush ? pushRemote(c, r.sha) : Promise.resolve();
+      return p.then(function(){ return changed; }, function(e){
+        if (e.status === 409 && attempt < 3) return syncOnce(c, attempt + 1);
+        throw e;
+      });
+    });
+  }
+  function describeError(e){
+    if (e && e.status === 404) return "Couldn't find that repository. Check the username and repository name, and that the token can reach it.";
+    if (e && e.message && e.status !== undefined && e.message !== "Failed to fetch") return e.message;
+    return "Couldn't reach GitHub. Your changes are saved on this device and will sync when you're back online.";
+  }
+  function setSyncUi(msg){
+    var c = syncConfig();
+    $("syMsg").textContent = msg || "";
+    if (!c) $("syncHint").textContent = "Off. Your habits stay on this device only.";
+    else {
+      var t = c.last ? new Date(c.last).toLocaleTimeString(undefined, {hour: "numeric", minute: "2-digit"}) : "not yet";
+      $("syncHint").textContent = "On, using " + c.owner + "/" + c.repo + ". Last synced: " + t + ".";
+    }
+  }
+  function sync(manual){
+    var c = syncConfig();
+    if (!c) return Promise.resolve();
+    if (syncing){ syncAgain = true; return Promise.resolve(); }
+    syncing = true;
+    setStatus("Syncing…");
+    return syncOnce(c, 0).then(function(changed){
+      c.last = Date.now(); saveSyncConfig(c);
+      if (changed){ rebuildDays(); save(true); if (!editing) render(); }
+      setStatus("Synced");
+      setSyncUi(manual ? "Synced." : "");
+    }).catch(function(e){
+      var m = describeError(e);
+      setStatus(m); setSyncUi(m);
+    }).then(function(){
+      syncing = false;
+      if (syncAgain){ syncAgain = false; scheduleSync(); }
+    });
+  }
+  function scheduleSync(){
+    if (!syncConfig()) return;
+    clearTimeout(syncTimer);
+    syncTimer = setTimeout(function(){ sync(false); }, 1500);
+  }
+  $("syConnect").addEventListener("click", function(){
+    var c = {owner: $("syOwner").value.trim(), repo: $("syRepo").value.trim(), token: $("syToken").value.trim()};
+    if (!c.owner || !c.repo || !c.token){ setSyncUi("Fill in all three boxes."); return; }
+    saveSyncConfig(c);
+    $("syToken").value = "";
+    sync(true);
+  });
+  $("syNow").addEventListener("click", function(){
+    if (!syncConfig()){ setSyncUi("Not connected yet."); return; }
+    sync(true);
+  });
+  $("syOff").addEventListener("click", function(){
+    try { localStorage.removeItem(SYNC_KEY); } catch(e){}
+    $("syOwner").value = ""; $("syRepo").value = ""; $("syToken").value = "";
+    setSyncUi("Disconnected. The token was removed from this device. Your habits here are unchanged.");
+    setStatus("Saved on this device");
+  });
 
   /* ---------- grid ---------- */
   function paintCell(btn, it, on){
@@ -224,10 +402,10 @@
     var itemId = b.getAttribute("data-i"), dk = b.getAttribute("data-d");
     var it = items.filter(function(x){ return x.id === itemId; })[0];
     if (!it) return;
-    var v = days[dk] = days[dk] || {};
-    if (v[itemId] === 1) delete v[itemId]; else v[itemId] = 1;
-    if (!Object.keys(v).length) delete days[dk];
-    paintCell(b, it, v[itemId] === 1);
+    var on = !(days[dk] && days[dk][itemId] === 1);
+    setCell(dk, itemId, on ? 1 : 0);
+    rebuildDays();
+    paintCell(b, it, on);
     updateCount(itemId);
     save();
   });
@@ -240,27 +418,27 @@
       var sw = document.createElement("button"); sw.className = "swatch"; sw.style.background = it.color;
       sw.setAttribute("aria-label","Change color");
       sw.addEventListener("click", function(){
-        var k = PALETTE.indexOf(it.color); it.color = PALETTE[(k + 1) % PALETTE.length]; save(); render();
+        var k = PALETTE.indexOf(it.color); it.color = PALETTE[(k + 1) % PALETTE.length]; touchCfg(); save(); render();
       });
       li.appendChild(sw);
       var inp = document.createElement("input"); inp.type = "text"; inp.value = it.name; inp.maxLength = 60;
       inp.addEventListener("change", function(){
         var n = inp.value.trim(); if (!n){ inp.value = it.name; return; }
-        it.name = n; save(); render();
+        it.name = n; touchCfg(); save(); render();
       });
       li.appendChild(inp);
       [["↑",-1],["↓",1]].forEach(function(p){
         var b = document.createElement("button"); b.className = "small"; b.textContent = p[0];
         b.addEventListener("click", function(){
           var j = i + p[1]; if (j < 0 || j >= items.length) return;
-          var t = items[i]; items[i] = items[j]; items[j] = t; save(); render();
+          var t = items[i]; items[i] = items[j]; items[j] = t; touchCfg(); save(); render();
         });
         li.appendChild(b);
       });
       var del = document.createElement("button"); del.className = "small del";
       del.textContent = pendingDelete === it.id ? "Sure?" : "✕";
       del.addEventListener("click", function(){
-        if (pendingDelete === it.id){ items.splice(i,1); pendingDelete = null; save(); }
+        if (pendingDelete === it.id){ items.splice(i,1); pendingDelete = null; touchCfg(); save(); }
         else pendingDelete = it.id;
         render();
       });
@@ -268,6 +446,7 @@
       ul.appendChild(li);
     });
     $("restoreBtn").textContent = pendingRestore ? "Replace everything? Tap again" : "Restore from pasted text";
+    setSyncUi($("syMsg").textContent);
   }
   function render(){
     $("gridView").hidden = editing;
@@ -319,18 +498,30 @@
   $("expThis").addEventListener("click", function(){ var t = todayDate(); doExport(new Date(t.getFullYear(), t.getMonth(), 1)); });
   $("expLast").addEventListener("click", function(){ var t = todayDate(); doExport(new Date(t.getFullYear(), t.getMonth()-1, 1)); });
 
+  // Backups never include the sync token.
   $("backupBtn").addEventListener("click", function(){
-    var text = JSON.stringify({app: "habit-grid", version: 1, saved: key(todayDate()), items: items, days: days});
+    var text = JSON.stringify({app: "habit-grid", version: 2, saved: key(todayDate()), items: items, cells: cells});
     shareFile("habit-grid-backup-" + key(todayDate()) + ".json", text, "application/json");
   });
   function tryRestore(text){
     var o;
     try { o = JSON.parse(text); } catch(e){ setStatus("That doesn't look like a backup."); return false; }
-    if (!o || !Array.isArray(o.items) || !o.days || typeof o.days !== "object"){ setStatus("That doesn't look like a backup."); return false; }
+    if (!o || !Array.isArray(o.items) || (!o.cells && !o.days)){ setStatus("That doesn't look like a backup."); return false; }
+    var now = Date.now(), nc = {};
+    // anything not in the backup is marked cleared, so it also disappears on other synced devices
+    Object.keys(cells).forEach(function(k){ nc[k] = [0, Math.max(now, cells[k][1] + 1)]; });
+    if (o.cells){
+      Object.keys(o.cells).forEach(function(k){ var c = o.cells[k]; if (Array.isArray(c) && c[0] === 1) nc[k] = [1, now + 1]; });
+    } else {
+      Object.keys(o.days).forEach(function(dk){
+        Object.keys(o.days[dk] || {}).forEach(function(id){ if (o.days[dk][id] === 1) nc[dk + "|" + id] = [1, now + 1]; });
+      });
+    }
     items = o.items.filter(function(it){ return it && it.id && it.name; });
     items.forEach(function(it){ if (!it.color) it.color = pickColor(); });
-    days = o.days;
-    save(); didScroll = false; pendingRestore = false; render();
+    cells = nc;
+    cfgT = Math.max(now, cfgT + 1);
+    rebuildDays(); save(); didScroll = false; pendingRestore = false; render();
     setStatus("Restored " + items.length + " habits.");
     return true;
   }
@@ -353,17 +544,20 @@
   $("editToggle").addEventListener("click", function(){ editing = !editing; pendingDelete = null; pendingRestore = false; render(); });
   function addItem(){
     var inp = $("newName"), n = inp.value.trim(); if (!n) return;
-    items.push({id:newId(), name:n, color:pickColor()}); inp.value = ""; save(); render();
+    items.push({id:newId(), name:n, color:pickColor()}); inp.value = ""; touchCfg(); save(); render();
   }
   $("addBtn").addEventListener("click", addItem);
   $("newName").addEventListener("keydown", function(e){ if (e.key === "Enter") addItem(); });
-  // a new day started while the app was in the background
   document.addEventListener("visibilitychange", function(){
-    if (!document.hidden && !editing && renderedDay !== key(todayDate())){ didScroll = false; render(); }
+    if (document.hidden) return;
+    if (!editing && renderedDay !== key(todayDate())){ didScroll = false; render(); }
+    sync(false);
   });
 
   init();
   render();
+  setSyncUi("");
+  sync(false);
 
   if ("serviceWorker" in navigator && (location.protocol === "https:" || location.hostname === "localhost" || location.hostname === "127.0.0.1")){
     window.addEventListener("load", function(){ navigator.serviceWorker.register("sw.js").catch(function(){}); });
